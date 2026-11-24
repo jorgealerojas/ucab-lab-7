@@ -1,0 +1,217 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  UCAB Lab 7 - AWS IoT Core, S3 Data Lake, Glue y Athena
+  para el experimento Edge/Fog de cadena de frio.
+
+Parameters:
+  LabId:
+    Type: String
+    AllowedPattern: '^[0-9a-f]{16}$'
+    ConstraintDescription: Debe contener exactamente 16 digitos hexadecimales minusculos.
+
+Rules:
+  OhioOnly:
+    Assertions:
+      - Assert: !Equals [!Ref 'AWS::Region', us-east-2]
+        AssertDescription: Este laboratorio solo puede desplegarse en us-east-2.
+
+Resources:
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub 'ucab-lab-7-${AWS::AccountId}-${AWS::Region}-${LabId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      Tags:
+        - Key: Course
+          Value: INFO-02028
+        - Key: Lab
+          Value: '7'
+        - Key: LabId
+          Value: !Ref LabId
+
+  IoTRuleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: iot.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RouteOnlyThisLab
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource:
+                  - !Sub '${DataLakeBucket.Arn}/bronze/*'
+                  - !Sub '${DataLakeBucket.Arn}/errors/iot/*'
+
+  TelemetryTopicRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub 'ucab_lab_7_${LabId}_telemetry'
+      TopicRulePayload:
+        AwsIotSqlVersion: '2016-03-23'
+        Description: !Sub 'Enruta exclusivamente la telemetria del laboratorio ${LabId}'
+        RuleDisabled: false
+        Sql: !Sub "SELECT * FROM 'ucab/lab7/${LabId}/telemetry/+'"
+        Actions:
+          - S3:
+              BucketName: !Ref DataLakeBucket
+              Key: 'bronze/year=${parse_time("yyyy", timestamp(), "UTC")}/month=${parse_time("MM", timestamp(), "UTC")}/day=${parse_time("dd", timestamp(), "UTC")}/hour=${parse_time("HH", timestamp(), "UTC")}/${newuuid()}.json'
+              RoleArn: !GetAtt IoTRuleRole.Arn
+        ErrorAction:
+          S3:
+            BucketName: !Ref DataLakeBucket
+            Key: 'errors/iot/${timestamp()}-${newuuid()}.json'
+            RoleArn: !GetAtt IoTRuleRole.Arn
+
+  DevicePolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: !Sub 'ucab_lab_7_${LabId}_publisher'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: iot:Connect
+            Resource: !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:client/ucab-lab-7-${LabId}-*'
+          - Effect: Allow
+            Action: iot:Publish
+            Resource: !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:topic/ucab/lab7/${LabId}/telemetry/*'
+
+  EdgeThing:
+    Type: AWS::IoT::Thing
+    Properties:
+      ThingName: !Sub 'ucab-lab-7-${LabId}-edge'
+      AttributePayload:
+        Attributes:
+          course: INFO-02028
+          layer: edge
+
+  FogThing:
+    Type: AWS::IoT::Thing
+    Properties:
+      ThingName: !Sub 'ucab-lab-7-${LabId}-fog'
+      AttributePayload:
+        Attributes:
+          course: INFO-02028
+          layer: fog
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub 'ucab_lab_7_${LabId}'
+        Description: !Sub 'Catalogo aislado del laboratorio ${LabId}'
+
+  BronzeTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: bronze_telemetry
+        Description: Eventos JSON inmutables recibidos desde AWS IoT Core.
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+          EXTERNAL: 'TRUE'
+          projection.enabled: 'true'
+          projection.year.type: integer
+          projection.year.range: '2025,2030'
+          projection.year.digits: '4'
+          projection.month.type: integer
+          projection.month.range: '1,12'
+          projection.month.digits: '2'
+          projection.day.type: integer
+          projection.day.range: '1,31'
+          projection.day.digits: '2'
+          projection.hour.type: integer
+          projection.hour.range: '0,23'
+          projection.hour.digits: '2'
+          storage.location.template: !Sub 's3://${DataLakeBucket}/bronze/year=${!year}/month=${!month}/day=${!day}/hour=${!hour}/'
+        PartitionKeys:
+          - Name: year
+            Type: string
+          - Name: month
+            Type: string
+          - Name: day
+            Type: string
+          - Name: hour
+            Type: string
+        StorageDescriptor:
+          Location: !Sub 's3://${DataLakeBucket}/bronze/'
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters:
+              ignore.malformed.json: 'false'
+          Columns:
+            - Name: events
+              Type: 'array<struct<event_id:string,pipeline:string,device_id:string,gateway_id:string,trip_id:string,lot_id:string,event_time:string,sample_count:int,avg_temperature_c:double,min_temperature_c:double,max_temperature_c:double,avg_humidity_pct:double,max_vibration_g:double,anomaly_count:int,local_alarm:boolean,replayed:boolean,source_event_ids:array<string>>>'
+
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub 'ucab-lab-7-${LabId}'
+      Description: !Sub 'Consultas aisladas y limitadas del laboratorio ${LabId}'
+      State: ENABLED
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        # CTAS necesita external_location para materializar la zona Silver.
+        # El output por defecto sigue aislado, pero no se impone sobre CTAS.
+        EnforceWorkGroupConfiguration: false
+        PublishCloudWatchMetricsEnabled: true
+        BytesScannedCutoffPerQuery: 1073741824
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${DataLakeBucket}/athena-results/'
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+
+Outputs:
+  DataLakeBucketName:
+    Value: !Ref DataLakeBucket
+  DatabaseName:
+    Value: !Ref GlueDatabase
+  BronzeTableName:
+    Value: !Ref BronzeTable
+  AthenaWorkGroupName:
+    Value: !Ref AthenaWorkGroup
+  DevicePolicyName:
+    Value: !Ref DevicePolicy
+  EdgeThingName:
+    Value: !Ref EdgeThing
+  FogThingName:
+    Value: !Ref FogThing
+  TopicPrefix:
+    Value: !Sub 'ucab/lab7/${LabId}/telemetry'
+  TopicRuleName:
+    Value: !Ref TelemetryTopicRule

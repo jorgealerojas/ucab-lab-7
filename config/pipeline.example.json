@@ -1,0 +1,11 @@
+{
+  "region": "us-east-2",
+  "iot_endpoint": "REEMPLAZAR_ENDPOINT",
+  "topic_prefix": "REEMPLAZAR_TOPIC_PREFIX",
+  "window_size": 10,
+  "min_temperature_c": 2.0,
+  "max_temperature_c": 8.0,
+  "devices": 12,
+  "samples_per_device": 240,
+  "publish_batch_size": 200
+}
